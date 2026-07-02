@@ -4,6 +4,7 @@
 #include "riscv.h"
 #include "spinlock.h"
 #include "proc.h"
+#include "mlfqinfo.h"
 #include "defs.h"
 
 struct cpu cpus[NCPU];
@@ -48,12 +49,23 @@ void
 procinit(void)
 {
   struct proc *p;
-  
+  // 1. Initialize the global locks used for PID generation and waiting.
   initlock(&pid_lock, "nextpid");
   initlock(&wait_lock, "wait_lock");
+
+  // 2. Loop through every slot in the NPROC (64) process table.
   for(p = proc; p < &proc[NPROC]; p++) {
+
+      // 3. Initialize the lock that protects THIS specific process slot.
       initlock(&p->lock, "proc");
+
+      // 4. Set it to UNUSED so the kernel knows this slot is empty.
       p->state = UNUSED;
+
+      p->syscalls = 0;
+
+      // 5. Assign a pre-calculated memory address for its kernel stack.
+      // (p - proc) is pointer subtraction that gives the index (0, 1, 2...)
       p->kstack = KSTACK((int) (p - proc));
   }
 }
@@ -82,10 +94,20 @@ mycpu(void)
 struct proc*
 myproc(void)
 {
+
+  // 1. Stop all interrupts on THIS core.
+  // This ensures we don't get moved to another CPU while calculating.
   push_off();
+
+  // 2. Identify which CPU core we are currently standing on.
   struct cpu *c = mycpu();
+
+  // 3. Look at that CPU's internal record to see which process it is running.
   struct proc *p = c->proc;
+
+  // 4. Safely allow interrupts to occur again.
   pop_off();
+
   return p;
 }
 
@@ -145,7 +167,21 @@ found:
   memset(&p->context, 0, sizeof(p->context));
   p->context.ra = (uint64)forkret;
   p->context.sp = p->kstack + PGSIZE;
-
+  p->syscalls = 0;
+  p->queueInfo.ticks[0] = 0;
+  p->queueInfo.ticks[1] = 0;
+  p->queueInfo.ticks[2] = 0;
+  p->queueInfo.ticks[3] = 0;
+  p->queueInfo.times_scheduled = 0;
+  p->queueInfo.total_syscalls = 0;
+  p->queueInfo.ticks_in_slice = 0;
+  p->queueInfo.syscalls_at_start = 0;
+  p->queueInfo.level = 0;
+  p->page_faults=0;
+  p->pages_evicted=0;
+  p->pages_swapped_in=0;
+  p->pages_swapped_out=0;
+  p->resident_pages=0;
   return p;
 }
 
@@ -169,6 +205,21 @@ freeproc(struct proc *p)
   p->killed = 0;
   p->xstate = 0;
   p->state = UNUSED;
+  p->syscalls = 0;
+  p->queueInfo.level = 0;
+  p->queueInfo.times_scheduled = 0;
+  p->queueInfo.total_syscalls = 0;
+  p->queueInfo.ticks[0]=0;
+  p->queueInfo.ticks[1]=0;
+  p->queueInfo.ticks[2]=0;
+  p->queueInfo.ticks[3]=0;
+  p->queueInfo.ticks_in_slice=0;
+  p->queueInfo.syscalls_at_start =0;
+  p->page_faults=0;
+  p->pages_evicted=0;
+  p->pages_swapped_in=0;
+  p->pages_swapped_out=0;
+  p->resident_pages=0;
 }
 
 // Create a user page table for a given process, with no user memory,
@@ -188,7 +239,7 @@ proc_pagetable(struct proc *p)
   // only the supervisor uses it, on the way
   // to/from user space, so not PTE_U.
   if(mappages(pagetable, TRAMPOLINE, PGSIZE,
-              (uint64)trampoline, PTE_R | PTE_X) < 0){
+              (uint64)trampoline, PTE_R | PTE_X,p) < 0){
     uvmfree(pagetable, 0);
     return 0;
   }
@@ -196,7 +247,7 @@ proc_pagetable(struct proc *p)
   // map the trapframe page just below the trampoline page, for
   // trampoline.S.
   if(mappages(pagetable, TRAPFRAME, PGSIZE,
-              (uint64)(p->trapframe), PTE_R | PTE_W) < 0){
+              (uint64)(p->trapframe), PTE_R | PTE_W,p) < 0){
     uvmunmap(pagetable, TRAMPOLINE, 1, 0);
     uvmfree(pagetable, 0);
     return 0;
@@ -227,7 +278,7 @@ userinit(void)
   p->cwd = namei("/");
 
   p->state = RUNNABLE;
-
+  p->queueInfo.level = 0;
   release(&p->lock);
 }
 
@@ -269,7 +320,7 @@ kfork(void)
   }
 
   // Copy user memory from parent to child.
-  if(uvmcopy(p->pagetable, np->pagetable, p->sz) < 0){
+  if(uvmcopy(p->pagetable, np->pagetable, p->sz,np) < 0){
     freeproc(np);
     release(&np->lock);
     return -1;
@@ -300,15 +351,26 @@ kfork(void)
 
   acquire(&np->lock);
   np->state = RUNNABLE;
+  np->queueInfo.level = 0;
+  np->queueInfo.ticks_in_slice = 0;
+  np->queueInfo.ticks[0]=0;
+  np->queueInfo.ticks[1]=0;
+  np->queueInfo.ticks[2]=0;
+  np->queueInfo.ticks[3]=0;
+  np->queueInfo.syscalls_at_start=0;
+  np->queueInfo.times_scheduled=0;
+  np->queueInfo.total_syscalls=0;
+  np->page_faults=0;
+  np->pages_evicted=0;
+  np->pages_swapped_in=0;
+  np->pages_swapped_out=0;
   release(&np->lock);
-
   return pid;
 }
 
 // Pass p's abandoned children to init.
 // Caller must hold wait_lock.
-void
-reparent(struct proc *p)
+void reparent(struct proc *p)
 {
   struct proc *pp;
 
@@ -414,6 +476,93 @@ kwait(uint64 addr)
   }
 }
 
+int kGetnumchild(){
+  int count = 0;
+  struct proc* p = myproc();
+  acquire(&wait_lock);
+  for(struct proc* pp = proc; pp < &proc[NPROC]; pp++){
+    acquire(&pp->lock);
+    if(pp->parent == p && pp->state != ZOMBIE && pp->state != UNUSED)count++;
+    release(&pp->lock);
+  }
+  release(&wait_lock);
+  return count;
+}
+
+int kGetChildsyscount(int pid){
+  struct proc* pp;
+  acquire(&wait_lock);
+  for(pp=proc; pp < &proc[NPROC]; pp++){
+    if(pp->pid == pid && pp->parent == myproc() && pp->state!= UNUSED){
+      int count = -1;
+      acquire(&pp->lock);
+      count = pp->syscalls;
+      release(&pp->lock);
+      release(&wait_lock);
+      return count;
+    }
+  }
+  release(&wait_lock);
+  return -1;
+}
+
+int ksys_getmlfqinfo(int pid,uint64 addr){
+  struct mlfqinfo info;
+  struct proc* pp;
+  struct proc* current_p=myproc();
+  for(pp=proc; pp < &proc[NPROC]; pp++){
+    acquire(&pp->lock);
+    if(pp->pid == pid && pp->state!= UNUSED){
+      info.level = pp->queueInfo.level;
+      info.ticks[0] = pp->queueInfo.ticks[0];
+      info.ticks[1] = pp->queueInfo.ticks[1];
+      info.ticks[2] = pp->queueInfo.ticks[2];
+      info.ticks[3] = pp->queueInfo.ticks[3];
+      info.times_scheduled = pp->queueInfo.times_scheduled;
+      info.total_syscalls = pp->queueInfo.total_syscalls;
+      release(&pp->lock);
+      if(copyout(current_p->pagetable, addr, (char *)&info, sizeof(info)) < 0)return -1;
+      return 0;
+    }
+    release(&pp->lock);
+  }
+  return -1;
+}
+
+int ksys_getvmstats(int pid,uint64 addr){
+  struct proc* p;
+  struct proc* target=0;
+  for(p=proc;p<&proc[NPROC];p++){
+    acquire(&p->lock);
+    if(p->pid == pid){
+      target=p;
+      break;
+    }
+    release(&p->lock);
+  }
+  if(target == 0) return -1;
+  struct{
+    int page_faults;
+    int pages_evicted;
+    int pages_swapped_in;
+    int pages_swapped_out;
+    int resident_pages;
+  } stats;
+
+  stats.page_faults = target->page_faults;
+  stats.pages_evicted = target->pages_evicted;
+  stats.pages_swapped_in = target->pages_swapped_in;
+  stats.pages_swapped_out = target->pages_swapped_out;
+  stats.resident_pages = target->resident_pages;
+
+  release(&target->lock);
+
+  if(copyout(myproc()->pagetable,addr,(char *)&stats,sizeof(stats)) < 0)
+    return -1;
+
+  return 0;
+}
+
 // Per-CPU process scheduler.
 // Each CPU calls scheduler() after setting itself up.
 // Scheduler never returns.  It loops, doing:
@@ -421,39 +570,91 @@ kwait(uint64 addr)
 //  - swtch to start running that process.
 //  - eventually that process transfers control
 //    via swtch back to the scheduler.
-void
-scheduler(void)
-{
+
+uint64 ksys_getsyscount(struct proc* p){
+  return (p->syscalls);
+}
+
+void scheduler(void){
   struct proc *p;
   struct cpu *c = mycpu();
 
   c->proc = 0;
+  int last_boost = 0;
   for(;;){
     // The most recent process to run may have had interrupts
     // turned off; enable them to avoid a deadlock if all
     // processes are waiting. Then turn them back off
     // to avoid a possible race between an interrupt
     // and wfi.
+    static int lastIndex[4]={0};
     intr_on();
-    intr_off();
 
-    int found = 0;
-    for(p = proc; p < &proc[NPROC]; p++) {
-      acquire(&p->lock);
-      if(p->state == RUNNABLE) {
-        // Switch to chosen process.  It is the process's job
-        // to release its lock and then reacquire it
-        // before jumping back to us.
-        p->state = RUNNING;
-        c->proc = p;
-        swtch(&c->context, &p->context);
-
-        // Process is done running for now.
-        // It should have changed its p->state before coming back.
-        c->proc = 0;
-        found = 1;
+    if(ticks%128==0 && ticks > last_boost){
+      last_boost = ticks;
+      struct proc* tt;
+      for(tt = proc; tt < &proc[NPROC]; tt++){
+        acquire(&tt->lock);
+        if(tt->state == RUNNABLE){
+          tt->queueInfo.level=0;
+          tt->queueInfo.ticks_in_slice=0;
+        }
+        release(&tt->lock);
       }
-      release(&p->lock);
+      lastIndex[0]=0;
+      lastIndex[1]=0;
+      lastIndex[2]=0;
+      lastIndex[3]=0;
+    }
+    intr_off();
+    int found = 0;
+    int level = 0;
+    while(level < 4){
+        for(int i=0;i<NPROC;i++){
+          int index = (lastIndex[level]+i)%NPROC;
+          p = &proc[index];
+
+          acquire(&p->lock);
+          if(p->state == RUNNABLE && p->queueInfo.level == level) {
+            p->state = RUNNING;
+            c->proc = p;
+            p->queueInfo.times_scheduled++;
+            p->queueInfo.syscalls_at_start = ksys_getsyscount(p);
+            swtch(&c->context, &p->context);
+
+            c->proc = 0;
+            p->queueInfo.total_syscalls = p->syscalls;
+            found++;
+            release(&p->lock);
+            lastIndex[level]=(index+1)%NPROC;
+            break;
+          }
+          release(&p->lock);
+        }
+        if(found > 0)break;
+        level++;
+
+      //   for(p = proc; p < &proc[NPROC]; p++) {
+      //   acquire(&p->lock);
+      //   if(p->state == RUNNABLE && p->queueInfo.level == level) {
+      //     // Switch to chosen process.  It is the process's job
+      //     // to release its lock and then reacquire it
+      //     // before jumping back to us.
+      //     p->state = RUNNING;
+      //     c->proc = p;
+      //     p->queueInfo.times_scheduled++;
+      //     swtch(&c->context, &p->context);
+
+      //     // Process is done running for now.
+      //     // It should have changed its p->state before coming back.
+      //     c->proc = 0;
+      //     if(p->queueInfo.level < 3)p->queueInfo.level++;
+      //     p->queueInfo.total_syscalls = p->syscalls;
+      //     found++;break;
+      //   }
+      //   release(&p->lock);
+      // }
+      // if(found > 0)break;
     }
     if(found == 0) {
       // nothing to run; stop running on this core until an interrupt.
@@ -589,9 +790,7 @@ wakeup(void *chan)
 // Kill the process with the given pid.
 // The victim won't exit until it tries to return
 // to user space (see usertrap() in trap.c).
-int
-kkill(int pid)
-{
+int kkill(int pid){
   struct proc *p;
 
   for(p = proc; p < &proc[NPROC]; p++){

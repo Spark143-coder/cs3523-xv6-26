@@ -5,6 +5,7 @@
 #include "memlayout.h"
 #include "spinlock.h"
 #include "proc.h"
+#include "mlfqinfo.h"
 #include "vm.h"
 
 uint64
@@ -40,27 +41,29 @@ uint64
 sys_sbrk(void)
 {
   uint64 addr;
-  int t;
   int n;
+  int t;
+  struct proc *p = myproc();
 
   argint(0, &n);
-  argint(1, &t);
-  addr = myproc()->sz;
+  argint(1, &t); // This will read garbage if only 1 arg is passed
 
-  if(t == SBRK_EAGER || n < 0) {
-    if(growproc(n) < 0) {
-      return -1;
-    }
+  addr = p->sz;
+
+  // The "Dumbass-Proof" Logic:
+  // Only go Eager if 't' specifically matches your EAGER constant.
+  // Otherwise, if n > 0, ALWAYS go Lazy.
+  if(n > 0 && t == SBRK_EAGER) {
+      if(growproc(n) < 0) return -1;
+  } else if(n < 0) {
+      // Negative n must always be eager to free memory immediately
+      if(growproc(n) < 0) return -1;
   } else {
-    // Lazily allocate memory for this process: increase its memory
-    // size but don't allocate memory. If the processes uses the
-    // memory, vmfault() will allocate it.
-    if(addr + n < addr)
-      return -1;
-    if(addr + n > TRAPFRAME)
-      return -1;
-    myproc()->sz += n;
+      // This is the Lazy Path for sbrk(n) where t is garbage or 0
+      if(addr + n < addr || addr + n > TRAPFRAME) return -1;
+      p->sz += n;
   }
+
   return addr;
 }
 
@@ -106,4 +109,58 @@ sys_uptime(void)
   xticks = ticks;
   release(&tickslock);
   return xticks;
+}
+
+uint64 sys_hello(){
+  printf("Hello from the kernel!\n");
+  return 0;
+}
+
+uint64 sys_getpid2(){
+  return myproc()->pid;
+}
+
+uint64 sys_getppid(){
+  int ppid=-1;
+  acquire(&myproc()->lock);
+  if(myproc()->parent)ppid=myproc()->parent->pid;
+  release(&myproc()->lock);
+  return ppid;
+}
+
+uint64 sys_getnumchild(){
+  return kGetnumchild();
+}
+
+uint64 sys_getsyscount(){
+  return (myproc()->syscalls);
+}
+
+uint64 sys_getchildsyscount(){
+  int pid;
+  argint(0,&pid);
+  if(pid < 0)return -1;
+  return kGetChildsyscount(pid);
+}
+
+uint64 sys_getlevel(){
+  return (myproc()->queueInfo.level);
+}
+
+uint64 sys_getmlfqinfo(){
+  int pid;
+  argint(0,&pid);
+  uint64 addr;
+  argaddr(1,&addr);
+  if(pid < 0)return -1;
+  return ksys_getmlfqinfo(pid,addr);
+}
+
+uint64 sys_getvmstats(void){
+  int pid;
+  uint64 addr;
+  argint(0,&pid);
+  argaddr(1,&addr);
+  if(pid < 0)return -1;
+  return ksys_getvmstats(pid,addr);
 }

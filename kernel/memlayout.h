@@ -1,3 +1,6 @@
+#ifndef MEMLAYOUT_H
+#define MEMLAYOUT_H
+
 // Physical memory layout
 
 // qemu -machine virt is set up like this,
@@ -6,8 +9,8 @@
 // 00001000 -- boot ROM, provided by qemu
 // 02000000 -- CLINT
 // 0C000000 -- PLIC
-// 10000000 -- uart0 
-// 10001000 -- virtio disk 
+// 10000000 -- uart0
+// 10001000 -- virtio disk
 // 80000000 -- qemu's boot ROM loads the kernel here,
 //             then jumps here.
 // unused RAM after 80000000.
@@ -38,6 +41,7 @@
 // from physical address 0x80000000 to PHYSTOP.
 #define KERNBASE 0x80000000L
 #define PHYSTOP (KERNBASE + 128*1024*1024)
+#define MAX_PHYS_PAGES ((PHYSTOP - KERNBASE) / PGSIZE)
 
 // map the trampoline page to the highest address,
 // in both user and kernel space.
@@ -57,3 +61,5 @@
 //   TRAPFRAME (p->trapframe, used by the trampoline)
 //   TRAMPOLINE (the same page as in the kernel)
 #define TRAPFRAME (TRAMPOLINE - PGSIZE)
+
+#endif

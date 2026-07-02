@@ -68,21 +68,78 @@ usertrap(void)
     syscall();
   } else if((which_dev = devintr()) != 0){
     // ok
-  } else if((r_scause() == 15 || r_scause() == 13) &&
-            vmfault(p->pagetable, r_stval(), (r_scause() == 13)? 1 : 0) != 0) {
-    // page fault on lazily-allocated page
-  } else {
-    printf("usertrap(): unexpected scause 0x%lx pid=%d\n", r_scause(), p->pid);
-    printf("            sepc=0x%lx stval=0x%lx\n", r_sepc(), r_stval());
-    setkilled(p);
   }
+  else if(r_scause()==13 || r_scause()==15){
+    uint64 va = r_stval();
+    struct proc *p = myproc();
+    if(va >= p->sz || va < PGROUNDDOWN(p->trapframe->sp)){
+        setkilled(p);
+    }
+    else{
+        // Assuming vmfault returns 0 on success and -1 on error
+        if(vmfault(p->pagetable, va, (r_scause() == 13 ? 1 : 0)) == 0){
+            setkilled(p);
+        }
+        else{
+            p->page_faults++; // Only count it if it was a valid lazy allocation!
+        }
+    }
+}
 
   if(killed(p))
     kexit(-1);
 
   // give up the CPU if this is a timer interrupt.
-  if(which_dev == 2)
-    yield();
+  if(which_dev == 2){
+    struct proc* p = myproc();
+    if(p && p->state == RUNNING){
+        acquire(&p->lock);
+
+      p->queueInfo.ticks[p->queueInfo.level]++;
+      p->queueInfo.ticks_in_slice++;
+      int syscallsAfter = p->syscalls;
+      int difference = syscallsAfter-(p->queueInfo.syscalls_at_start);
+      if(p->queueInfo.level == 0){
+        if(p->queueInfo.ticks_in_slice >= 2){
+          if(difference < p->queueInfo.ticks_in_slice)p->queueInfo.level++;
+          p->queueInfo.ticks_in_slice = 0;
+          release(&p->lock);
+          yield();
+          goto user_return;
+        }
+      }
+      else if(p->queueInfo.level == 1){
+        if(p->queueInfo.ticks_in_slice >= 4){
+          if(difference < p->queueInfo.ticks_in_slice)p->queueInfo.level++;
+          p->queueInfo.ticks_in_slice = 0;
+          release(&p->lock);
+          yield();
+          goto user_return;
+        }
+      }
+      else if(p->queueInfo.level == 2){
+        if(p->queueInfo.ticks_in_slice >= 8){
+          if(difference < p->queueInfo.ticks_in_slice)p->queueInfo.level++;
+          p->queueInfo.ticks_in_slice = 0;
+          release(&p->lock);
+          yield();
+          goto user_return;
+        }
+      }
+      else if(p->queueInfo.level == 3){
+        if(p->queueInfo.ticks_in_slice >= 16){
+          p->queueInfo.ticks_in_slice = 0;
+          release(&p->lock);
+          yield();
+          goto user_return;
+        }
+      }
+    }
+
+    release(&p->lock);
+  }
+
+user_return:
 
   prepare_return();
 
@@ -132,8 +189,7 @@ prepare_return(void)
 
 // interrupts and exceptions from kernel code go here via kernelvec,
 // on whatever the current kernel stack is.
-void 
-kerneltrap()
+void kerneltrap()
 {
   int which_dev = 0;
   uint64 sepc = r_sepc();
@@ -182,8 +238,7 @@ clockintr()
 // returns 2 if timer interrupt,
 // 1 if other device,
 // 0 if not recognized.
-int
-devintr()
+int devintr()
 {
   uint64 scause = r_scause();
 

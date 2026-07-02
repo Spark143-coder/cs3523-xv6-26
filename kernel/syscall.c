@@ -11,11 +11,22 @@
 int
 fetchaddr(uint64 addr, uint64 *ip)
 {
+  // Get the "Passport" for the current process
   struct proc *p = myproc();
+
+  // 1. SAFETY CHECK
+  // Is the user-provided address higher than the amount of memory they actually own (p->sz)?
+  // Or is it so high that adding 8 bytes (sizeof uint64) overflows or hits the guard page?
   if(addr >= p->sz || addr+sizeof(uint64) > p->sz) // both tests needed, in case of overflow
-    return -1;
+    return -1;  // Security breach or segment fault: Deny!
+
+    // 2. THE COPY
+  // Use the process's map (pagetable) to find and copy the data.
+  // We copy from 'addr' (user) into 'ip' (kernel).
   if(copyin(p->pagetable, (char *)ip, addr, sizeof(*ip)) != 0)
     return -1;
+
+
   return 0;
 }
 
@@ -24,9 +35,15 @@ fetchaddr(uint64 addr, uint64 *ip)
 int
 fetchstr(uint64 addr, char *buf, int max)
 {
+
   struct proc *p = myproc();
+
+  // It attempts to copy the string from user memory (addr)
+  // using that process's map (p->pagetable)
+  // into our kernel workspace (buf).
   if(copyinstr(p->pagetable, buf, addr, max) < 0)
     return -1;
+
   return strlen(buf);
 }
 
@@ -34,6 +51,8 @@ static uint64
 argraw(int n)
 {
   struct proc *p = myproc();
+
+  // Look at the 'n-th' argument requested
   switch (n) {
   case 0:
     return p->trapframe->a0;
@@ -48,6 +67,8 @@ argraw(int n)
   case 5:
     return p->trapframe->a5;
   }
+
+  // If we get here, n was not 0-5. This is a kernel bug!
   panic("argraw");
   return -1;
 }
@@ -101,6 +122,15 @@ extern uint64 sys_unlink(void);
 extern uint64 sys_link(void);
 extern uint64 sys_mkdir(void);
 extern uint64 sys_close(void);
+extern uint64 sys_hello(void);
+extern uint64 sys_getpid2(void);
+extern uint64 sys_getppid(void);
+extern uint64 sys_getnumchild(void);
+extern uint64 sys_getsyscount(void);
+extern uint64 sys_getchildsyscount(void);
+extern uint64 sys_getlevel(void);
+extern uint64 sys_getmlfqinfo(void);
+extern uint64 sys_getvmstats(void);
 
 // An array mapping syscall numbers from syscall.h
 // to the function that handles the system call.
@@ -126,6 +156,15 @@ static uint64 (*syscalls[])(void) = {
 [SYS_link]    sys_link,
 [SYS_mkdir]   sys_mkdir,
 [SYS_close]   sys_close,
+[SYS_getvmstats]   sys_getvmstats,
+[SYS_hello]   sys_hello,
+[SYS_getpid2] sys_getpid2,
+[SYS_getppid] sys_getppid,
+[SYS_getnumchild] sys_getnumchild,
+[SYS_getsyscount] sys_getsyscount,
+[SYS_getchildsyscount] sys_getchildsyscount,
+[SYS_getlevel]  sys_getlevel,
+[SYS_getmlfqinfo] sys_getmlfqinfo,
 };
 
 void
@@ -138,6 +177,8 @@ syscall(void)
   if(num > 0 && num < NELEM(syscalls) && syscalls[num]) {
     // Use num to lookup the system call function for num, call it,
     // and store its return value in p->trapframe->a0
+    p->syscalls++;
+    p->queueInfo.total_syscalls = p->syscalls;
     p->trapframe->a0 = syscalls[num]();
   } else {
     printf("%d %s: unknown sys call %d\n",
